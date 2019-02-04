@@ -36,7 +36,7 @@ class BlockDumper;
 class ApfsContainer
 {
 public:
-	ApfsContainer(Device &disk, uint64_t start, uint64_t len);
+	ApfsContainer(Device *disk_main, uint64_t main_start, uint64_t main_len, Device *disk_tier2 = 0, uint64_t tier2_start = 0, uint64_t tier2_len = 0);
 	~ApfsContainer();
 
 	bool Init();
@@ -55,19 +55,23 @@ public:
 	void dump(BlockDumper& bd);
 
 private:
-	Device &m_disk;
-	const uint64_t m_part_start;
-	const uint64_t m_part_len;
+	Device *m_main_disk;
+	const uint64_t m_main_part_start;
+	const uint64_t m_main_part_len;
+
+	Device *m_tier2_disk;
+	const uint64_t m_tier2_part_start;
+	const uint64_t m_tier2_part_len;
 
 	std::string m_passphrase;
 
-	APFS_NX_Superblock m_nx;
+	nx_superblock_t m_nx;
 
 	CheckPointMap m_cpm;
 	ApfsNodeMapperBTree m_omap;
 
 	std::vector<uint8_t> m_sm_data;
-	const APFS_Spaceman *m_sm;
+	const spaceman_phys_t *m_sm;
 	// Block_8_11 -> omap
 
 	// BTree m_omap_tree; // see ApfsNodeMapperBTree

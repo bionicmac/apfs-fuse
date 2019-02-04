@@ -22,6 +22,7 @@
 #ifdef __linux__
 #include <fuse/fuse.h>
 #include <fuse/fuse_lowlevel.h>
+#include <unistd.h>
 #endif
 #ifdef __APPLE__
 #include <fuse/fuse.h>
@@ -47,10 +48,11 @@
 
 #include <iostream>
 
-
+constexpr double FUSE_TIMEOUT = 86400.0;
 
 static struct fuse_lowlevel_ops ops;
-static Device *g_disk = nullptr;
+static Device *g_disk_main = nullptr;
+static Device *g_disk_tier2 = nullptr;
 static ApfsContainer *g_container = nullptr;
 static ApfsVolume *g_volume = nullptr;
 
@@ -67,7 +69,7 @@ struct File
 	File() {}
 	~File() {}
 
-	bool IsCompressed() const { return (ino.ino.bsd_flags & 0x20) != 0; }
+	bool IsCompressed() const { return (ino.bsd_flags & APFS_UF_COMPRESSED) != 0; }
 
 	ApfsDir::Inode ino;
 	std::vector<uint8_t> decomp_data;
@@ -101,16 +103,25 @@ static bool apfs_stat_internal(fuse_ino_t ino, struct stat &st)
 
 		// st_dev?
 		st.st_ino = ino;
-		st.st_mode = rec.ino.mode;
+		st.st_mode = rec.mode;
 		// st.st_nlink = rec.ino.refcnt;
 		st.st_nlink = 1;
+
+		// st.st_uid = rec.owner;
+		// st.st_gid = rec.group;
+		st.st_uid = geteuid();
+		st.st_gid = getegid();
+
+		if (rec.optional_present_flags & ApfsDir::Inode::INO_HAS_RDEV)
+			st.st_rdev = rec.rdev;
+
 		// st_uid
 		// st_gid
 		// st_rdev?
 
 		if (S_ISREG(st.st_mode))
 		{
-			if (rec.ino.bsd_flags & 0x20) // Compressed
+			if (rec.bsd_flags & APFS_UF_COMPRESSED) // Compressed
 			{
 				std::vector<uint8_t> data;
 				rc = dir.GetAttribute(data, ino, "com.apple.decmpfs");
@@ -150,41 +161,47 @@ static bool apfs_stat_internal(fuse_ino_t ino, struct stat &st)
 						return false;
 				}
 			}
-			else
+			else if (rec.optional_present_flags & ApfsDir::Inode::INO_HAS_DSTREAM)
 			{
-				st.st_size = rec.sizes.size;
+				st.st_size = rec.ds_size;
+
+				// st.st_size = rec.sizes.size;
 				// st_blksize
 				// st.st_blocks = rec.sizes.size_on_disk / 512;
+			}
+			else
+			{
+				st.st_size = 0;
 			}
 		}
 		else if (S_ISDIR(st.st_mode))
 		{
-			st.st_size = rec.ino.nchildren;
+			st.st_size = rec.nchildren_nlink;
 		}
 
 #ifdef __linux__
 		// What about this?
-		// st.st_birthtime.tv_sec = rec.ino.birthtime / div_nsec;
-		// st.st_birthtime.tv_nsec = rec.ino.birthtime % div_nsec;
+		// st.st_birthtime.tv_sec = rec.ino->create_time / div_nsec;
+		// st.st_birthtime.tv_nsec = rec.ino->create_time % div_nsec;
 
-		st.st_mtim.tv_sec = rec.ino.mtime / div_nsec;
-		st.st_mtim.tv_nsec = rec.ino.mtime % div_nsec;
-		st.st_ctim.tv_sec = rec.ino.ctime / div_nsec;
-		st.st_ctim.tv_nsec = rec.ino.ctime % div_nsec;
-		st.st_atim.tv_sec = rec.ino.atime / div_nsec;
-		st.st_atim.tv_nsec = rec.ino.atime % div_nsec;
+		st.st_mtim.tv_sec = rec.mod_time / div_nsec;
+		st.st_mtim.tv_nsec = rec.mod_time % div_nsec;
+		st.st_ctim.tv_sec = rec.change_time / div_nsec;
+		st.st_ctim.tv_nsec = rec.change_time % div_nsec;
+		st.st_atim.tv_sec = rec.access_time / div_nsec;
+		st.st_atim.tv_nsec = rec.access_time % div_nsec;
 #endif
 #ifdef __APPLE__
-		st.st_birthtimespec.tv_sec = rec.ino.birthtime / div_nsec;
-		st.st_birthtimespec.tv_nsec = rec.ino.birthtime % div_nsec;
-		st.st_mtimespec.tv_sec = rec.ino.mtime / div_nsec;
-		st.st_mtimespec.tv_nsec = rec.ino.mtime % div_nsec;
-		st.st_ctimespec.tv_sec = rec.ino.ctime / div_nsec;
-		st.st_ctimespec.tv_nsec = rec.ino.ctime % div_nsec;
-		st.st_atimespec.tv_sec = rec.ino.atime / div_nsec;
-		st.st_atimespec.tv_nsec = rec.ino.atime % div_nsec;
-		
-		// ? st.st_gen = rec.ino.gen_count;
+		st.st_birthtimespec.tv_sec = rec.create_time / div_nsec;
+		st.st_birthtimespec.tv_nsec = rec.create_time % div_nsec;
+		st.st_mtimespec.tv_sec = rec.mod_time / div_nsec;
+		st.st_mtimespec.tv_nsec = rec.mod_time % div_nsec;
+		st.st_ctimespec.tv_sec = rec.change_time / div_nsec;
+		st.st_ctimespec.tv_nsec = rec.change_time % div_nsec;
+		st.st_atimespec.tv_sec = rec.access_time / div_nsec;
+		st.st_atimespec.tv_nsec = rec.access_time % div_nsec;
+
+		// st.st_gen = rec.ino.gen_count;
 #endif
 		return true;
 	}
@@ -227,7 +244,7 @@ static void apfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 		std::cout << (rc ? "OK" : "FAIL") << std::endl;
 
 	if (rc)
-		fuse_reply_attr(req, &st, 1.0);
+		fuse_reply_attr(req, &st, FUSE_TIMEOUT);
 	else
 		fuse_reply_err(req, ENOENT);
 }
@@ -322,7 +339,7 @@ static void apfs_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 		std::cout << "apfs_lookup: ino=" << ino << " name=" << name << " => ";
 
 	ApfsDir dir(*g_volume);
-	ApfsDir::Name res;
+	ApfsDir::DirRec res;
 	bool rc;
 
 	rc = dir.LookupName(res, ino, name);
@@ -338,11 +355,11 @@ static void apfs_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 	{
 		fuse_entry_param e;
 
-		e.ino = res.inode_id;
-		e.attr_timeout = 1.0;
-		e.entry_timeout = 1.0;
+		e.ino = res.file_id;
+		e.attr_timeout = FUSE_TIMEOUT;
+		e.entry_timeout = FUSE_TIMEOUT;
 
-		rc = apfs_stat_internal(res.inode_id, e.attr);
+		rc = apfs_stat_internal(res.file_id, e.attr);
 
 		if (g_debug & Dbg_Info)
 			std::cout << "    apfs_stat_internal => " << (rc ? "OK" : "FAIL") << std::endl;
@@ -391,8 +408,7 @@ static void apfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 
 			if (g_debug & Dbg_Info)
 			{
-				std::cout << "Inode info: size=" << f->ino.sizes.size
-				          << ", alloced_size=" << f->ino.sizes.alloced_size << std::endl;
+				// std::cout << "Inode info: size=" << f->ino.sizes.size << ", alloced_size=" << f->ino.sizes.alloced_size << std::endl;
 			}
 			rc = DecompressFile(dir, ino, f->decomp_data, attr);
 			// In strict mode, do not return uncompressed data.
@@ -436,7 +452,7 @@ static void apfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
 		std::vector<char> buf(size, 0);
 
 		// rc =
-		dir.ReadFile(buf.data(), file->ino.ino.private_id, off, size);
+		dir.ReadFile(buf.data(), file->ino.private_id, off, size);
 
 		// std::cerr << "apfs_read: fuse_reply_buf(req, " << reinterpret_cast<uint64_t>(buf.data()) << ", " << size << ")" << std::endl;
 
@@ -455,7 +471,7 @@ static void apfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
 	}
 }
 
-static void dirbuf_add(fuse_req_t req, std::vector<char> &dirbuf, const char *name, fuse_ino_t ino)
+static void dirbuf_add(fuse_req_t req, std::vector<char> &dirbuf, const char *name, fuse_ino_t ino, mode_t mode)
 {
 	struct stat st;
 	size_t oldsize;
@@ -464,6 +480,7 @@ static void dirbuf_add(fuse_req_t req, std::vector<char> &dirbuf, const char *na
 	oldsize = dirbuf.size();
 	dirbuf.resize(oldsize + fuse_add_direntry(req, nullptr, 0, name, nullptr, 0));
 	st.st_ino = ino;
+	st.st_mode = mode;
 	fuse_add_direntry(req, &dirbuf[oldsize], dirbuf.size() - oldsize, name, &st, dirbuf.size());
 }
 
@@ -481,7 +498,7 @@ static int reply_buf_limited(fuse_req_t req, const char *buf, size_t bufsize, of
 static void apfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
 	ApfsDir dir(*g_volume);
-	std::vector<ApfsDir::Name> dir_list;
+	std::vector<ApfsDir::DirRec> dir_list;
 	Directory *dirptr = reinterpret_cast<Directory *>(fi->fh);
 	std::vector<char> &dirbuf = dirptr->dirbuf;
 	bool rc;
@@ -518,7 +535,7 @@ static void apfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 		}
 
 		for (size_t k = 0; k < dir_list.size(); k++)
-			dirbuf_add(req, dirbuf, dir_list[k].name.c_str(), dir_list[k].inode_id);
+			dirbuf_add(req, dirbuf, dir_list[k].name.c_str(), dir_list[k].file_id, (dir_list[k].flags & DREC_TYPE_MASK) << 12);
 	}
 
 	reply_buf_limited(req, dirbuf.data(), dirbuf.size(), off, size);
@@ -580,6 +597,7 @@ void usage(const char *name)
 	std::cout << std::endl;
 	std::cout << "Options:" << std::endl;
 	std::cout << "-d level      : Enable debug output in the console." << std::endl;
+	std::cout << "-f device     : Specify secondary device for fusion drives." << std::endl;
 	std::cout << "-o options    : Additional mount options." << std::endl;
 	std::cout << "-v volume-id  : Specify number of volume to be mounted." << std::endl;
 	std::cout << "-r passphrase : Specify volume passphrase. The driver will ask for it if needed." << std::endl;
@@ -607,14 +625,17 @@ int main(int argc, char *argv[])
 	struct fuse_args args = FUSE_ARGS_INIT(0, nullptr);
 	struct fuse_chan *ch;
 	const char *mountpoint = nullptr;
-	const char *dev_path = nullptr;
+	const char *main_dev_path = nullptr;
+	const char *tier2_dev_path = nullptr;
 	int err = -1;
 	int opt;
 	std::string mount_options;
 	std::string passphrase;
 	unsigned int volume_id = 0;
-	uint64_t container_offset = 0;
-	uint64_t container_size = 0;
+	uint64_t main_offset = 0;
+	uint64_t main_size = 0;
+	uint64_t tier2_offset = 0;
+	uint64_t tier2_size = 0;
 	int partition_id = -1;
 
 	// static const char *dev_path = "/mnt/data/Projekte/VS17/Apfs/Data/ios_11_0_1.img";
@@ -644,12 +665,15 @@ int main(int argc, char *argv[])
 	ops.releasedir = apfs_releasedir;
 	// ops.statfs = apfs_statfs;
 
-	while ((opt = getopt(argc, argv, "d:o:p:v:r:s:l")) != -1)
+	while ((opt = getopt(argc, argv, "d:f:o:p:v:r:s:l")) != -1)
 	{
 		switch (opt)
 		{
 			case 'd':
 				g_debug = strtoul(optarg, nullptr, 10);
+				break;
+			case 'f':
+				tier2_dev_path = optarg;
 				break;
 			case 'o':
 				add_option(mount_options, optarg, nullptr);
@@ -664,7 +688,7 @@ int main(int argc, char *argv[])
 				passphrase = optarg;
 				break;
 			case 's':
-				container_offset = strtoul(optarg, nullptr, 10);
+				main_offset = strtoul(optarg, nullptr, 10);
 				break;
 			case 'l':
 				g_lax = true;
@@ -682,35 +706,45 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	dev_path = argv[optind];
+	main_dev_path = argv[optind];
 	mountpoint = argv[optind + 1];
 
 	add_option(mount_options, "ro", nullptr);
 
-	g_disk = Device::OpenDevice(dev_path);
+	g_disk_main = Device::OpenDevice(main_dev_path);
+	if (tier2_dev_path)
+		g_disk_tier2 = Device::OpenDevice(tier2_dev_path);
 
-	if (!g_disk)
+	if (!g_disk_main)
 	{
 		std::cerr << "Error opening device!" << std::endl;
 		return 1;
 	}
 
-	container_size = g_disk->GetSize();
-
-	if (container_offset >= container_size)
+	if (tier2_dev_path && !g_disk_tier2)
 	{
-		std::cerr << "Invalid container offset specified" << std::endl;
-		g_disk->Close();
-		delete g_disk;
+		std::cerr << "Error opening secondary device!" << std::endl;
 		return 1;
 	}
 
-	if (container_offset == 0)
+	main_size = g_disk_main->GetSize();
+	if (g_disk_tier2)
+		tier2_size = g_disk_tier2->GetSize();
+
+	if (main_offset >= main_size)
+	{
+		std::cerr << "Invalid container offset specified" << std::endl;
+		g_disk_main->Close();
+		delete g_disk_main;
+		return 1;
+	}
+
+	if (main_offset == 0)
 	{
 		GptPartitionMap gpt;
 		bool rc;
 
-		rc = gpt.LoadAndVerify(*g_disk);
+		rc = gpt.LoadAndVerify(*g_disk_main);
 		if (rc)
 		{
 			if (g_debug & Dbg_Info)
@@ -720,25 +754,41 @@ int main(int argc, char *argv[])
 				partition_id = gpt.FindFirstAPFSPartition();
 
 			if (partition_id != -1)
-				gpt.GetPartitionOffsetAndSize(partition_id, container_offset, container_size);
+				gpt.GetPartitionOffsetAndSize(partition_id, main_offset, main_size);
 		}
 	}
 	else
-		container_size -= container_offset;
+		main_size -= main_offset;
 
-	g_container = new ApfsContainer(*g_disk, container_offset, container_size);
+	if (g_disk_tier2)
+	{
+		GptPartitionMap gpt;
+
+		if (gpt.LoadAndVerify(*g_disk_tier2))
+		{
+			if (g_debug & Dbg_Info)
+				std::cout << "Found valid GPT partition table on secondary device. Looking for APFS partition." << std::endl;
+
+			partition_id = gpt.FindFirstAPFSPartition();
+
+			if (partition_id != -1)
+				gpt.GetPartitionOffsetAndSize(partition_id, tier2_offset, tier2_size);
+		}
+	}
+
+	g_container = new ApfsContainer(g_disk_main, main_offset, main_size, g_disk_tier2, tier2_offset, tier2_size);
 	g_container->Init();
 	g_volume = g_container->GetVolume(volume_id, passphrase);
 	if (!g_volume)
 	{
 		std::cerr << "Unable to get volume!" << std::endl;
 		delete g_container;
-		g_disk->Close();
-		delete g_disk;
+		g_disk_main->Close();
+		delete g_disk_main;
 		return 1;
 	}
 
-	add_option(mount_options, "fsname", dev_path);
+	add_option(mount_options, "fsname", main_dev_path);
 	add_option(mount_options, "allow_other", nullptr);
 
 	fuse_opt_add_arg(&args, "apfs-fuse");
@@ -769,8 +819,8 @@ int main(int argc, char *argv[])
 
 	delete g_volume;
 	delete g_container;
-	g_disk->Close();
-	delete g_disk;
+	g_disk_main->Close();
+	delete g_disk_main;
 
 	return err ? 1 : 0;
 }
